@@ -31,6 +31,7 @@ BOOL MpvLoad(void)
     MPV_LOAD(set_wakeup_callback, MpvSetWakeupCallbackFn, "mpv_set_wakeup_callback");
     MPV_LOAD(wait_event, MpvWaitEventFn, "mpv_wait_event");
     MPV_LOAD(error_string, MpvErrorStringFn, "mpv_error_string");
+    MPV_LOAD(get_property, MpvGetPropertyFn, "mpv_get_property");
 
     return TRUE;
 }

@@ -67,6 +67,14 @@ cmake --build build --config Release
 - `libmpv-2.dll`：必须在 `PATH` 中，或放在 `build/Release/`（或 `build/Debug/`）下。
 - `yt-dlp.exe`：放在可执行文件同目录。
 - `favorites.txt`：首次运行自动创建，格式为 `名称\nURL\n` 循环。
+- `mpv.conf`（可选）：放在可执行文件同目录，mpv 初始化时自动读取，可覆盖播放器默认选项。
+- `input.conf`（可选）：放在可执行文件同目录，mpv 初始化时自动读取，用于自定义快捷键。
+
+## 播放窗口行为
+
+- 播放窗口支持拖拽边框调整大小。
+- 视频开始播放后，窗口客户区会自动调整为视频分辨率。
+- 快捷键由 mpv 根据 `input.conf`（或内置默认）处理。
 
 ## 常见注意事项
 

@@ -33,6 +33,7 @@ typedef struct {
     mpv_handle *mpv;
     HWND hWnd;
     HWND hVideo;
+    BOOL sizeAdjusted;
 } PlaybackContext;
 
 typedef struct {
@@ -97,6 +98,46 @@ static void GetConfigPath(wchar_t *out, size_t size)
     out[size - 1] = L'\0';
     size_t remain = size - wcslen(out) - 1;
     wcsncat(out, L"favorites.txt", remain);
+}
+
+static void GetExeDirectory(wchar_t *out, size_t size)
+{
+    if (size == 0) return;
+    wchar_t path[MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) {
+        out[0] = L'\0';
+        return;
+    }
+    wchar_t *slash = wcsrchr(path, L'\\');
+    if (slash) slash[1] = L'\0';
+    wcsncpy(out, path, size - 1);
+    out[size - 1] = L'\0';
+}
+
+static void EnsureDefaultMpvConfig(void)
+{
+    wchar_t exeDir[MAX_PATH];
+    GetExeDirectory(exeDir, MAX_PATH);
+    if (exeDir[0] == L'\0') return;
+
+    wchar_t configPath[MAX_PATH];
+    if (_snwprintf(configPath, MAX_PATH, L"%smpv.conf", exeDir) < 0) return;
+
+    DWORD attr = GetFileAttributesW(configPath);
+    if (attr != INVALID_FILE_ATTRIBUTES) return;
+
+    FILE *fp = _wfopen(configPath, L"w");
+    if (!fp) return;
+
+    fwprintf(fp, L"# LivePlayer default mpv config\n");
+    fwprintf(fp, L"# You can modify or delete this file; it will not be overwritten.\n");
+    fwprintf(fp, L"vo=gpu\n");
+    fwprintf(fp, L"hwdec=no\n");
+    fwprintf(fp, L"keep-open=no\n");
+    fwprintf(fp, L"ytdl=yes\n");
+    fwprintf(fp, L"ytdl-format=best\n");
+    fclose(fp);
 }
 
 static void SetDefaultFont(HWND hWnd)
@@ -249,6 +290,25 @@ static void OnMpvEvent(PlaybackContext *ctx)
         mpv_event *e = g_mpv.wait_event(ctx->mpv, 0);
         if (e->event_id == MPV_EVENT_NONE) break;
 
+        if (e->event_id == MPV_EVENT_VIDEO_RECONFIG) {
+            int64_t dwidth = 0;
+            int64_t dheight = 0;
+            int ok = g_mpv.get_property(ctx->mpv, "dwidth", MPV_FORMAT_INT64, &dwidth) >= 0 &&
+                     g_mpv.get_property(ctx->mpv, "dheight", MPV_FORMAT_INT64, &dheight) >= 0;
+            if (!ctx->sizeAdjusted && ok && dwidth > 0 && dheight > 0 && dwidth <= 8192 && dheight <= 8192 &&
+                ctx->hWnd && !IsIconic(ctx->hWnd) && !IsZoomed(ctx->hWnd)) {
+                RECT rc = { 0, 0, (LONG)dwidth, (LONG)dheight };
+                DWORD style = (DWORD)GetWindowLongPtr(ctx->hWnd, GWL_STYLE);
+                DWORD exStyle = (DWORD)GetWindowLongPtr(ctx->hWnd, GWL_EXSTYLE);
+                AdjustWindowRectEx(&rc, style, FALSE, exStyle);
+                int w = rc.right - rc.left;
+                int h = rc.bottom - rc.top;
+                SetWindowPos(ctx->hWnd, NULL, 0, 0, w, h,
+                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                ctx->sizeAdjusted = TRUE;
+            }
+        }
+
         if (e->event_id == MPV_EVENT_END_FILE) {
             mpv_event_end_file *ef = (mpv_event_end_file *)e->data;
             if (ef && (ef->reason == MPV_END_FILE_REASON_ERROR || ef->error < 0)) {
@@ -280,11 +340,17 @@ static BOOL InitPlaybackMpv(PlaybackContext *ctx, HWND hVideo, const wchar_t *ur
     snprintf(widStr, sizeof(widStr), "%lld", (long long)(intptr_t)hVideo);
     g_mpv.set_option_string(ctx->mpv, "wid", widStr);
 
-    g_mpv.set_option_string(ctx->mpv, "vo", "gpu");
-    g_mpv.set_option_string(ctx->mpv, "hwdec", "no");
-    g_mpv.set_option_string(ctx->mpv, "keep-open", "no");
-    g_mpv.set_option_string(ctx->mpv, "ytdl", "yes");
-    g_mpv.set_option_string(ctx->mpv, "ytdl-format", "best");
+    /* Other options are read from mpv.conf in the executable directory. */
+
+    wchar_t exeDir[MAX_PATH];
+    GetExeDirectory(exeDir, MAX_PATH);
+    if (exeDir[0] != L'\0') {
+        char *configDir = WideToUtf8(exeDir);
+        if (configDir) {
+            g_mpv.set_option_string(ctx->mpv, "config-dir", configDir);
+            free(configDir);
+        }
+    }
 
     wchar_t exePath[MAX_PATH];
     DWORD n = GetModuleFileNameW(NULL, exePath, MAX_PATH);
@@ -309,7 +375,11 @@ static BOOL InitPlaybackMpv(PlaybackContext *ctx, HWND hVideo, const wchar_t *ur
     }
 
     char *url = WideToUtf8(urlW);
-    if (!url) return FALSE;
+    if (!url) {
+        g_mpv.terminate_destroy(ctx->mpv);
+        ctx->mpv = NULL;
+        return FALSE;
+    }
     const char *cmd[] = { "loadfile", url, NULL };
     g_mpv.command_async(ctx->mpv, 0, cmd);
     free(url);
@@ -318,6 +388,54 @@ static BOOL InitPlaybackMpv(PlaybackContext *ctx, HWND hVideo, const wchar_t *ur
 }
 
 /* 播放窗口 */
+
+static void VkToMpvKeyName(UINT vk, BOOL shift, BOOL ctrl, BOOL alt, char *out, size_t outSize)
+{
+    out[0] = '\0';
+    if (outSize == 0) return;
+
+    char key[32] = {0};
+    if (vk >= '0' && vk <= '9') {
+        snprintf(key, sizeof(key), "%c", (char)vk);
+    } else if (vk >= 'A' && vk <= 'Z') {
+        if (shift && !ctrl && !alt) {
+            snprintf(key, sizeof(key), "%c", (char)vk);
+        } else {
+            snprintf(key, sizeof(key), "%c", (char)(vk + 32));
+        }
+    } else {
+        switch (vk) {
+        case VK_SPACE:  strncpy(key, "SPACE", sizeof(key) - 1); break;
+        case VK_RETURN: strncpy(key, "ENTER", sizeof(key) - 1); break;
+        case VK_ESCAPE: strncpy(key, "ESC", sizeof(key) - 1); break;
+        case VK_TAB:    strncpy(key, "TAB", sizeof(key) - 1); break;
+        case VK_BACK:   strncpy(key, "BS", sizeof(key) - 1); break;
+        case VK_DELETE: strncpy(key, "DEL", sizeof(key) - 1); break;
+        case VK_LEFT:   strncpy(key, "LEFT", sizeof(key) - 1); break;
+        case VK_RIGHT:  strncpy(key, "RIGHT", sizeof(key) - 1); break;
+        case VK_UP:     strncpy(key, "UP", sizeof(key) - 1); break;
+        case VK_DOWN:   strncpy(key, "DOWN", sizeof(key) - 1); break;
+        case VK_HOME:   strncpy(key, "HOME", sizeof(key) - 1); break;
+        case VK_END:    strncpy(key, "END", sizeof(key) - 1); break;
+        case VK_PRIOR:  strncpy(key, "PGUP", sizeof(key) - 1); break;
+        case VK_NEXT:   strncpy(key, "PGDWN", sizeof(key) - 1); break;
+        default:
+            if (vk >= VK_F1 && vk <= VK_F12) {
+                snprintf(key, sizeof(key), "F%d", (int)(vk - VK_F1 + 1));
+            }
+            break;
+        }
+    }
+
+    if (key[0] == '\0') return;
+
+    char mods[32] = {0};
+    if (ctrl)  strncat(mods, "ctrl+", sizeof(mods) - 1);
+    if (alt)   strncat(mods, "alt+", sizeof(mods) - 1);
+    if (shift) strncat(mods, "shift+", sizeof(mods) - 1);
+
+    snprintf(out, outSize, "%s%s", mods, key);
+}
 
 static LRESULT CALLBACK PlaybackWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
@@ -341,6 +459,27 @@ static LRESULT CALLBACK PlaybackWndProc(HWND hWnd, UINT message, WPARAM wParam, 
         }
 
         PlaybackWindowAdd(hWnd);
+        break;
+    }
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+    {
+        PlaybackContext *ctx = (PlaybackContext *)GetWindowLongPtr(hWnd, GWLP_USERDATA);
+        if (ctx && ctx->mpv) {
+            UINT vk = (UINT)wParam;
+            BOOL shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            BOOL ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            BOOL alt   = (GetKeyState(VK_MENU) & 0x8000) != 0;
+            char keyName[64];
+            VkToMpvKeyName(vk, shift, ctrl, alt, keyName, sizeof(keyName));
+            if (keyName[0] != '\0') {
+                const char *cmd[] = { "keypress", keyName, NULL };
+                g_mpv.command_async(ctx->mpv, 0, cmd);
+            }
+        }
+        if (message == WM_SYSKEYDOWN) {
+            return DefWindowProcW(hWnd, message, wParam, lParam);
+        }
         break;
     }
     case WM_SIZE:
@@ -367,8 +506,8 @@ static LRESULT CALLBACK PlaybackWndProc(HWND hWnd, UINT message, WPARAM wParam, 
                 g_mpv.set_wakeup_callback(ctx->mpv, NULL, NULL);
                 g_mpv.terminate_destroy(ctx->mpv);
             }
-            free(ctx);
             SetWindowLongPtr(hWnd, GWLP_USERDATA, 0);
+            free(ctx);
         }
         PlaybackWindowRemove(hWnd);
         break;
@@ -385,7 +524,7 @@ static void OpenPlaybackWindow(const wchar_t *name, const wchar_t *url)
     _snwprintf(title, 512, L"LivePlayer - %s", name);
 
     HWND hWnd = CreateWindowW(L"LivePlayerVideoClass", title,
-        WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME,
+        WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, 0, 960, 600,
         NULL, NULL, g_hInst, (LPVOID)url);
 
@@ -544,6 +683,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
         MessageBoxW(NULL, L"无法加载 libmpv-2.dll，请确认 mpv 已安装并在 PATH 中。", L"错误", MB_OK | MB_ICONERROR);
         return 1;
     }
+
+    EnsureDefaultMpvConfig();
 
     INITCOMMONCONTROLSEX iccex = { sizeof(iccex), ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&iccex);

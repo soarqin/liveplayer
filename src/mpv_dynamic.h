@@ -13,6 +13,7 @@ typedef int (*MpvCommandAsyncFn)(mpv_handle *ctx, uint64_t reply_userdata, const
 typedef void (*MpvSetWakeupCallbackFn)(mpv_handle *ctx, void (*cb)(void *d), void *d);
 typedef mpv_event *(*MpvWaitEventFn)(mpv_handle *ctx, double timeout);
 typedef const char *(*MpvErrorStringFn)(int error);
+typedef int (*MpvGetPropertyFn)(mpv_handle *ctx, const char *name, mpv_format format, void *data);
 
 typedef struct {
     MpvCreateFn create;
@@ -23,6 +24,7 @@ typedef struct {
     MpvSetWakeupCallbackFn set_wakeup_callback;
     MpvWaitEventFn wait_event;
     MpvErrorStringFn error_string;
+    MpvGetPropertyFn get_property;
 } MpvApi;
 
 extern MpvApi g_mpv;
