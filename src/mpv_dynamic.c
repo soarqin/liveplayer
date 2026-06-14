@@ -32,6 +32,8 @@ BOOL MpvLoad(void)
     MPV_LOAD(wait_event, MpvWaitEventFn, "mpv_wait_event");
     MPV_LOAD(error_string, MpvErrorStringFn, "mpv_error_string");
     MPV_LOAD(get_property, MpvGetPropertyFn, "mpv_get_property");
+    MPV_LOAD(request_log_messages, MpvRequestLogMessagesFn, "mpv_request_log_messages");
+    MPV_LOAD(observe_property, MpvObservePropertyFn, "mpv_observe_property");
 
     return TRUE;
 }

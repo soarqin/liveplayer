@@ -34,6 +34,11 @@ typedef struct {
     HWND hWnd;
     HWND hVideo;
     BOOL sizeAdjusted;
+    BOOL isFullscreen;
+    LONG_PTR savedStyle;
+    WINDOWPLACEMENT savedPlacement;
+    char errLog[8192];
+    size_t errLogLen;
 } PlaybackContext;
 
 typedef struct {
@@ -137,6 +142,9 @@ static void EnsureDefaultMpvConfig(void)
     fwprintf(fp, L"keep-open=no\n");
     fwprintf(fp, L"ytdl=yes\n");
     fwprintf(fp, L"ytdl-format=best\n");
+    fwprintf(fp, L"# Keyboard shortcuts (space/arrows/etc.) are handled by mpv itself.\n");
+    fwprintf(fp, L"input-default-bindings=yes\n");
+    fwprintf(fp, L"input-vo-keyboard=yes\n");
     fclose(fp);
 }
 
@@ -283,6 +291,60 @@ static void ShowMpvError(HWND hWnd, int err)
     MessageBoxW(hWnd, msg, L"解析/播放错误", MB_OK | MB_ICONERROR);
 }
 
+/* 弹出 mpv 的原始错误日志（UTF-8）。 */
+static void ShowMpvErrorMessage(HWND hWnd, const char *utf8)
+{
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+    if (wlen <= 0) return;
+    wchar_t *wmsg = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
+    if (!wmsg) return;
+    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wmsg, wlen);
+    MessageBoxW(hWnd, wmsg, L"播放错误", MB_OK | MB_ICONERROR);
+    free(wmsg);
+}
+
+/* 累积 mpv 的 error 级日志，供加载/播放失败时原样展示。 */
+static void AppendErrLog(PlaybackContext *ctx, const char *text)
+{
+    if (!text || !*text) return;
+    size_t avail = sizeof(ctx->errLog) - 1 - ctx->errLogLen;
+    if (avail == 0) return;
+    size_t tlen = strlen(text);
+    if (tlen > avail) tlen = avail;
+    memcpy(ctx->errLog + ctx->errLogLen, text, tlen);
+    ctx->errLogLen += tlen;
+    ctx->errLog[ctx->errLogLen] = '\0';
+}
+
+/* mpv 内嵌在 wid 子窗口里，无法自行全屏；因此监听 mpv 的 fullscreen 属性，
+   由我们对顶层窗口做无边框全屏切换。快捷键由用户在 input.conf 里自定义，
+   我们只对属性变化作出反应，而不是写死某个按键。 */
+static void SetPlaybackFullscreen(PlaybackContext *ctx, BOOL fullscreen)
+{
+    if (!ctx || !ctx->hWnd || fullscreen == ctx->isFullscreen) return;
+    HWND hWnd = ctx->hWnd;
+    if (fullscreen) {
+        MONITORINFO mi = { sizeof(mi) };
+        if (!GetMonitorInfo(MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST), &mi)) return;
+        ctx->savedStyle = GetWindowLongPtr(hWnd, GWL_STYLE);
+        ctx->savedPlacement.length = sizeof(ctx->savedPlacement);
+        GetWindowPlacement(hWnd, &ctx->savedPlacement);
+        SetWindowLongPtr(hWnd, GWL_STYLE, ctx->savedStyle & ~(LONG_PTR)WS_OVERLAPPEDWINDOW);
+        SetWindowPos(hWnd, HWND_TOP,
+                     mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+        ctx->isFullscreen = TRUE;
+    } else {
+        SetWindowLongPtr(hWnd, GWL_STYLE, ctx->savedStyle);
+        SetWindowPlacement(hWnd, &ctx->savedPlacement);
+        SetWindowPos(hWnd, NULL, 0, 0, 0, 0,
+                     SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER);
+        ctx->isFullscreen = FALSE;
+    }
+}
+
 static void OnMpvEvent(PlaybackContext *ctx)
 {
     if (!ctx || !ctx->mpv) return;
@@ -290,12 +352,35 @@ static void OnMpvEvent(PlaybackContext *ctx)
         mpv_event *e = g_mpv.wait_event(ctx->mpv, 0);
         if (e->event_id == MPV_EVENT_NONE) break;
 
+        if (e->event_id == MPV_EVENT_SHUTDOWN) {
+            /* mpv 收到 quit（无论绑定到哪个键）-> 关闭整个播放窗口。
+               DestroyWindow 会同步触发 WM_DESTROY 并释放 ctx，之后不可再用 ctx。 */
+            DestroyWindow(ctx->hWnd);
+            return;
+        }
+
+        if (e->event_id == MPV_EVENT_LOG_MESSAGE) {
+            mpv_event_log_message *lm = (mpv_event_log_message *)e->data;
+            if (lm) AppendErrLog(ctx, lm->text);
+            continue;
+        }
+
+        if (e->event_id == MPV_EVENT_PROPERTY_CHANGE) {
+            mpv_event_property *pc = (mpv_event_property *)e->data;
+            if (pc && pc->name && pc->data && pc->format == MPV_FORMAT_FLAG &&
+                strcmp(pc->name, "fullscreen") == 0) {
+                SetPlaybackFullscreen(ctx, (*(int *)pc->data) ? TRUE : FALSE);
+            }
+            continue;
+        }
+
         if (e->event_id == MPV_EVENT_VIDEO_RECONFIG) {
             int64_t dwidth = 0;
             int64_t dheight = 0;
             int ok = g_mpv.get_property(ctx->mpv, "dwidth", MPV_FORMAT_INT64, &dwidth) >= 0 &&
                      g_mpv.get_property(ctx->mpv, "dheight", MPV_FORMAT_INT64, &dheight) >= 0;
-            if (!ctx->sizeAdjusted && ok && dwidth > 0 && dheight > 0 && dwidth <= 8192 && dheight <= 8192 &&
+            if (!ctx->sizeAdjusted && !ctx->isFullscreen && ok && dwidth > 0 && dheight > 0 &&
+                dwidth <= 8192 && dheight <= 8192 &&
                 ctx->hWnd && !IsIconic(ctx->hWnd) && !IsZoomed(ctx->hWnd)) {
                 RECT rc = { 0, 0, (LONG)dwidth, (LONG)dheight };
                 DWORD style = (DWORD)GetWindowLongPtr(ctx->hWnd, GWL_STYLE);
@@ -312,12 +397,16 @@ static void OnMpvEvent(PlaybackContext *ctx)
         if (e->event_id == MPV_EVENT_END_FILE) {
             mpv_event_end_file *ef = (mpv_event_end_file *)e->data;
             if (ef && (ef->reason == MPV_END_FILE_REASON_ERROR || ef->error < 0)) {
-                if (ef->error < 0) {
+                if (ctx->errLogLen > 0) {
+                    ShowMpvErrorMessage(ctx->hWnd, ctx->errLog);
+                } else if (ef->error < 0) {
                     ShowMpvError(ctx->hWnd, ef->error);
                 } else {
                     MessageBoxW(ctx->hWnd, L"视频播放结束或解析失败。",
                                 L"解析/播放错误", MB_OK | MB_ICONERROR);
                 }
+                ctx->errLogLen = 0;
+                ctx->errLog[0] = '\0';
             }
         }
     }
@@ -336,9 +425,22 @@ static BOOL InitPlaybackMpv(PlaybackContext *ctx, HWND hVideo, const wchar_t *ur
     ctx->mpv = g_mpv.create();
     if (!ctx->mpv) return FALSE;
 
+    /* Capture mpv's own error log so a failure shows the real reason
+       (ytdl errors, network errors, ...) instead of a generic error string. */
+    g_mpv.request_log_messages(ctx->mpv, "error");
+
     char widStr[32];
     snprintf(widStr, sizeof(widStr), "%lld", (long long)(intptr_t)hVideo);
     g_mpv.set_option_string(ctx->mpv, "wid", widStr);
+
+    /* mpv owns the shortcut LOGIC (default bindings + input.conf); we only
+       forward raw key events from the playback window (see WM_KEYDOWN below),
+       because mpv's Win32 video window lives on its own thread and never holds
+       our keyboard focus. In libmpv both the default key bindings AND
+       config-file loading are OFF unless explicitly enabled here. */
+    g_mpv.set_option_string(ctx->mpv, "input-default-bindings", "yes");
+    g_mpv.set_option_string(ctx->mpv, "input-vo-keyboard", "yes");
+    g_mpv.set_option_string(ctx->mpv, "config", "yes");
 
     /* Other options are read from mpv.conf in the executable directory. */
 
@@ -374,6 +476,10 @@ static BOOL InitPlaybackMpv(PlaybackContext *ctx, HWND hVideo, const wchar_t *ur
         return FALSE;
     }
 
+    /* React to mpv's fullscreen state (toggled by whatever key the user binds,
+       or by fs=yes in mpv.conf) and apply it to our own top-level window. */
+    g_mpv.observe_property(ctx->mpv, 0, "fullscreen", MPV_FORMAT_FLAG);
+
     char *url = WideToUtf8(urlW);
     if (!url) {
         g_mpv.terminate_destroy(ctx->mpv);
@@ -389,6 +495,8 @@ static BOOL InitPlaybackMpv(PlaybackContext *ctx, HWND hVideo, const wchar_t *ur
 
 /* 播放窗口 */
 
+/* 把 Win32 虚拟键转换成 mpv 的按键名（仅做键名映射，具体快捷键行为由 mpv
+   依据内置默认绑定 / input.conf 决定）。 */
 static void VkToMpvKeyName(UINT vk, BOOL shift, BOOL ctrl, BOOL alt, char *out, size_t outSize)
 {
     out[0] = '\0';
@@ -464,6 +572,9 @@ static LRESULT CALLBACK PlaybackWndProc(HWND hWnd, UINT message, WPARAM wParam, 
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
     {
+        /* The playback top-level window holds keyboard focus (mpv's video
+           window is on a separate thread and never takes our focus), so we
+           translate the key and hand it to mpv, which decides what it does. */
         PlaybackContext *ctx = (PlaybackContext *)GetWindowLongPtr(hWnd, GWLP_USERDATA);
         if (ctx && ctx->mpv) {
             UINT vk = (UINT)wParam;
