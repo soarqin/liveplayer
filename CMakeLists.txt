@@ -32,9 +32,17 @@ set(SOURCES
 
 add_executable(${PROJECT_NAME} WIN32 ${SOURCES})
 
+# 禁用链接器自动生成 manifest：我们已在 resource.rc 中通过 RT_MANIFEST 嵌入了自定义 manifest
+if(MSVC)
+    set_target_properties(${PROJECT_NAME} PROPERTIES
+        LINK_FLAGS "/MANIFEST:NO"
+    )
+endif()
+
 target_link_libraries(${PROJECT_NAME} PRIVATE
     user32
     shell32
     comctl32
     gdi32
+    uxtheme
 )

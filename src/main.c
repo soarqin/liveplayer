@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
+#include <uxtheme.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,10 +18,12 @@
 
 #include "resource.h"
 
-#define ID_LISTBOX      100
+#define ID_LISTVIEW     100
 #define ID_BTN_ADD      101
 #define ID_BTN_DEL      102
 #define ID_BTN_PLAY     103
+#define ID_BTN_UP       104
+#define ID_BTN_DOWN     105
 
 #define WM_MPV_EVENT    (WM_USER + 1)
 
@@ -53,6 +56,11 @@ typedef struct {
     wchar_t *url;
     size_t urlLen;
 } AddDlgData;
+
+/* 收藏列表数组（与 ListView 行一一对应） */
+static FavoriteItem *g_favorites = NULL;
+static int g_favCount = 0;
+static int g_favCapacity = 0;
 
 static struct {
     HWND hWnd;
@@ -148,62 +156,136 @@ static void EnsureDefaultMpvConfig(void)
     fclose(fp);
 }
 
-static void SetDefaultFont(HWND hWnd)
+/* 现代 UI 字体：Segoe UI 9pt（Vista+），回退到系统默认字体。
+   字体句柄在进程生命周期内保持有效，程序退出时由 OS 回收。 */
+static HFONT g_hFont = NULL;
+
+static void CreateModernFont(void)
 {
-    SendMessage(hWnd, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), MAKELPARAM(TRUE, 0));
+    /* 使用 SystemParametersInfo 获取系统 UI 字体（跟随用户设置） */
+    NONCLIENTMETRICSW ncm = { 0 };
+    ncm.cbSize = sizeof(ncm);
+    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
+        g_hFont = CreateFontIndirectW(&ncm.lfMessageFont);
+    }
+    /* 回退：手动创建 Segoe UI 9pt */
+    if (!g_hFont) {
+        g_hFont = CreateFontW(
+            -MulDiv(9, GetDeviceCaps(GetDC(NULL), LOGPIXELSY), 72),
+            0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS,
+            L"Segoe UI");
+    }
 }
 
-/* 收藏列表管理 */
+static void SetModernFont(HWND hWnd)
+{
+    if (g_hFont) {
+        SendMessage(hWnd, WM_SETFONT, (WPARAM)g_hFont, MAKELPARAM(TRUE, 0));
+    }
+}
+
+/* ── 收藏数组管理 ─────────────────────────────────────────── */
+
+static BOOL FavArrayEnsure(void)
+{
+    if (g_favCount < g_favCapacity) return TRUE;
+    int newCap = g_favCapacity ? g_favCapacity * 2 : 8;
+    FavoriteItem *p = (FavoriteItem *)realloc(g_favorites, (size_t)newCap * sizeof(FavoriteItem));
+    if (!p) return FALSE;
+    g_favorites = p;
+    g_favCapacity = newCap;
+    return TRUE;
+}
+
+/* ── ListView 辅助 ────────────────────────────────────────── */
+
+/* 向 ListView 末尾插入一行（仅 UI，不修改 g_favorites）。 */
+static void LvAppendRow(int idx, const wchar_t *name, const wchar_t *url)
+{
+    LVITEMW lvi = { 0 };
+    lvi.mask    = LVIF_TEXT;
+    lvi.iItem   = idx;
+    lvi.iSubItem = 0;
+    lvi.pszText = (LPWSTR)name;
+    ListView_InsertItem(g_main.hList, &lvi);
+    ListView_SetItemText(g_main.hList, idx, 1, (LPWSTR)url);
+}
+
+/* 用 g_favorites[idx] 刷新 ListView 第 idx 行的两列文本。 */
+static void LvRefreshRow(int idx)
+{
+    if (idx < 0 || idx >= g_favCount) return;
+    ListView_SetItemText(g_main.hList, idx, 0, g_favorites[idx].name);
+    ListView_SetItemText(g_main.hList, idx, 1, g_favorites[idx].url);
+}
+
+static int LvGetSelected(void)
+{
+    return ListView_GetNextItem(g_main.hList, -1, LVNI_SELECTED);
+}
+
+static void LvSetSelected(int idx)
+{
+    if (idx < 0 || idx >= g_favCount) return;
+    ListView_SetItemState(g_main.hList, idx,
+        LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    ListView_EnsureVisible(g_main.hList, idx, FALSE);
+}
+
+/* ── 收藏列表管理（数组 + ListView 同步） ─────────────────── */
 
 static void FavoriteAdd(const wchar_t *name, const wchar_t *url)
 {
-    FavoriteItem *item = (FavoriteItem *)malloc(sizeof(FavoriteItem));
-    if (!item) return;
-    item->name = _wcsdup(name);
-    item->url = _wcsdup(url);
-    if (!item->name || !item->url) {
-        free(item->name);
-        free(item->url);
-        free(item);
-        return;
-    }
-    int idx = ListBox_AddString(g_main.hList, name);
-    if (idx != LB_ERR && idx != LB_ERRSPACE) {
-        ListBox_SetItemData(g_main.hList, idx, (LPARAM)item);
-    } else {
-        free(item->name);
-        free(item->url);
-        free(item);
-    }
+    if (!FavArrayEnsure()) return;
+    wchar_t *n = _wcsdup(name);
+    wchar_t *u = _wcsdup(url);
+    if (!n || !u) { free(n); free(u); return; }
+    int idx = g_favCount;
+    g_favorites[idx].name = n;
+    g_favorites[idx].url  = u;
+    g_favCount++;
+    LvAppendRow(idx, name, url);
 }
 
 static void FavoriteDelete(int idx)
 {
-    LPARAM data = ListBox_GetItemData(g_main.hList, idx);
-    if (data != (LPARAM)LB_ERR) {
-        FavoriteItem *item = (FavoriteItem *)data;
-        if (item) {
-            free(item->name);
-            free(item->url);
-            free(item);
-        }
-    }
-    ListBox_DeleteString(g_main.hList, idx);
+    if (idx < 0 || idx >= g_favCount) return;
+    free(g_favorites[idx].name);
+    free(g_favorites[idx].url);
+    /* 数组前移 */
+    memmove(&g_favorites[idx], &g_favorites[idx + 1],
+            (size_t)(g_favCount - idx - 1) * sizeof(FavoriteItem));
+    g_favCount--;
+    ListView_DeleteItem(g_main.hList, idx);
 }
 
 static void FavoriteClear(void)
 {
-    int count = ListBox_GetCount(g_main.hList);
-    for (int i = count - 1; i >= 0; i--) {
-        FavoriteDelete(i);
+    for (int i = 0; i < g_favCount; i++) {
+        free(g_favorites[i].name);
+        free(g_favorites[i].url);
     }
+    g_favCount = 0;
+    if (g_main.hList) ListView_DeleteAllItems(g_main.hList);
 }
 
 static const FavoriteItem *FavoriteGet(int idx)
 {
-    LPARAM data = ListBox_GetItemData(g_main.hList, idx);
-    if (data == (LPARAM)LB_ERR) return NULL;
-    return (const FavoriteItem *)data;
+    if (idx < 0 || idx >= g_favCount) return NULL;
+    return &g_favorites[idx];
+}
+
+/* 交换数组中两个相邻项，并刷新 ListView 对应行文本。 */
+static void FavoriteSwap(int a, int b)
+{
+    if (a < 0 || b < 0 || a >= g_favCount || b >= g_favCount) return;
+    FavoriteItem tmp = g_favorites[a];
+    g_favorites[a]   = g_favorites[b];
+    g_favorites[b]   = tmp;
+    LvRefreshRow(a);
+    LvRefreshRow(b);
 }
 
 static void LoadFavorites(void)
@@ -230,16 +312,13 @@ static void SaveFavorites(void)
         MessageBoxW(g_main.hWnd, L"无法保存收藏列表。", L"错误", MB_OK | MB_ICONERROR);
         return;
     }
-    int count = ListBox_GetCount(g_main.hList);
-    for (int i = 0; i < count; i++) {
-        const FavoriteItem *item = FavoriteGet(i);
-        if (!item) continue;
-        fwprintf(fp, L"%s\n%s\n", item->name, item->url);
+    for (int i = 0; i < g_favCount; i++) {
+        fwprintf(fp, L"%s\n%s\n", g_favorites[i].name, g_favorites[i].url);
     }
     fclose(fp);
 }
 
-/* 播放窗口管理 */
+/* ── 播放窗口管理 ─────────────────────────────────────────── */
 
 static void PlaybackWindowAdd(HWND hWnd)
 {
@@ -276,7 +355,7 @@ static void PlaybackWindowCloseAll(void)
     free(copy);
 }
 
-/* mpv 相关 */
+/* ── mpv 相关 ─────────────────────────────────────────────── */
 
 static void ShowMpvError(HWND hWnd, int err)
 {
@@ -291,7 +370,6 @@ static void ShowMpvError(HWND hWnd, int err)
     MessageBoxW(hWnd, msg, L"解析/播放错误", MB_OK | MB_ICONERROR);
 }
 
-/* 弹出 mpv 的原始错误日志（UTF-8）。 */
 static void ShowMpvErrorMessage(HWND hWnd, const char *utf8)
 {
     int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
@@ -303,7 +381,6 @@ static void ShowMpvErrorMessage(HWND hWnd, const char *utf8)
     free(wmsg);
 }
 
-/* 累积 mpv 的 error 级日志，供加载/播放失败时原样展示。 */
 static void AppendErrLog(PlaybackContext *ctx, const char *text)
 {
     if (!text || !*text) return;
@@ -316,9 +393,6 @@ static void AppendErrLog(PlaybackContext *ctx, const char *text)
     ctx->errLog[ctx->errLogLen] = '\0';
 }
 
-/* mpv 内嵌在 wid 子窗口里，无法自行全屏；因此监听 mpv 的 fullscreen 属性，
-   由我们对顶层窗口做无边框全屏切换。快捷键由用户在 input.conf 里自定义，
-   我们只对属性变化作出反应，而不是写死某个按键。 */
 static void SetPlaybackFullscreen(PlaybackContext *ctx, BOOL fullscreen)
 {
     if (!ctx || !ctx->hWnd || fullscreen == ctx->isFullscreen) return;
@@ -353,8 +427,6 @@ static void OnMpvEvent(PlaybackContext *ctx)
         if (e->event_id == MPV_EVENT_NONE) break;
 
         if (e->event_id == MPV_EVENT_SHUTDOWN) {
-            /* mpv 收到 quit（无论绑定到哪个键）-> 关闭整个播放窗口。
-               DestroyWindow 会同步触发 WM_DESTROY 并释放 ctx，之后不可再用 ctx。 */
             DestroyWindow(ctx->hWnd);
             return;
         }
@@ -425,24 +497,15 @@ static BOOL InitPlaybackMpv(PlaybackContext *ctx, HWND hVideo, const wchar_t *ur
     ctx->mpv = g_mpv.create();
     if (!ctx->mpv) return FALSE;
 
-    /* Capture mpv's own error log so a failure shows the real reason
-       (ytdl errors, network errors, ...) instead of a generic error string. */
     g_mpv.request_log_messages(ctx->mpv, "error");
 
     char widStr[32];
     snprintf(widStr, sizeof(widStr), "%lld", (long long)(intptr_t)hVideo);
     g_mpv.set_option_string(ctx->mpv, "wid", widStr);
 
-    /* mpv owns the shortcut LOGIC (default bindings + input.conf); we only
-       forward raw key events from the playback window (see WM_KEYDOWN below),
-       because mpv's Win32 video window lives on its own thread and never holds
-       our keyboard focus. In libmpv both the default key bindings AND
-       config-file loading are OFF unless explicitly enabled here. */
     g_mpv.set_option_string(ctx->mpv, "input-default-bindings", "yes");
     g_mpv.set_option_string(ctx->mpv, "input-vo-keyboard", "yes");
     g_mpv.set_option_string(ctx->mpv, "config", "yes");
-
-    /* Other options are read from mpv.conf in the executable directory. */
 
     wchar_t exeDir[MAX_PATH];
     GetExeDirectory(exeDir, MAX_PATH);
@@ -476,8 +539,6 @@ static BOOL InitPlaybackMpv(PlaybackContext *ctx, HWND hVideo, const wchar_t *ur
         return FALSE;
     }
 
-    /* React to mpv's fullscreen state (toggled by whatever key the user binds,
-       or by fs=yes in mpv.conf) and apply it to our own top-level window. */
     g_mpv.observe_property(ctx->mpv, 0, "fullscreen", MPV_FORMAT_FLAG);
 
     char *url = WideToUtf8(urlW);
@@ -493,10 +554,8 @@ static BOOL InitPlaybackMpv(PlaybackContext *ctx, HWND hVideo, const wchar_t *ur
     return TRUE;
 }
 
-/* 播放窗口 */
+/* ── 播放窗口 ─────────────────────────────────────────────── */
 
-/* 把 Win32 虚拟键转换成 mpv 的按键名（仅做键名映射，具体快捷键行为由 mpv
-   依据内置默认绑定 / input.conf 决定）。 */
 static void VkToMpvKeyName(UINT vk, BOOL shift, BOOL ctrl, BOOL alt, char *out, size_t outSize)
 {
     out[0] = '\0';
@@ -572,9 +631,6 @@ static LRESULT CALLBACK PlaybackWndProc(HWND hWnd, UINT message, WPARAM wParam, 
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
     {
-        /* The playback top-level window holds keyboard focus (mpv's video
-           window is on a separate thread and never takes our focus), so we
-           translate the key and hand it to mpv, which decides what it does. */
         PlaybackContext *ctx = (PlaybackContext *)GetWindowLongPtr(hWnd, GWLP_USERDATA);
         if (ctx && ctx->mpv) {
             UINT vk = (UINT)wParam;
@@ -645,12 +701,12 @@ static void OpenPlaybackWindow(const wchar_t *name, const wchar_t *url)
     }
 }
 
-/* 主窗口 */
+/* ── 主窗口 ───────────────────────────────────────────────── */
 
 static void PlaySelected(void)
 {
-    int idx = ListBox_GetCurSel(g_main.hList);
-    if (idx == LB_ERR) return;
+    int idx = LvGetSelected();
+    if (idx < 0) return;
     const FavoriteItem *item = FavoriteGet(idx);
     if (!item) return;
     OpenPlaybackWindow(item->name, item->url);
@@ -703,18 +759,70 @@ static void OnAddFavorite(void)
 
     FavoriteAdd(name, url);
     SaveFavorites();
+    /* 选中新添加的行 */
+    LvSetSelected(g_favCount - 1);
 }
 
 static void OnDelFavorite(void)
 {
-    int idx = ListBox_GetCurSel(g_main.hList);
-    if (idx == LB_ERR) return;
+    int idx = LvGetSelected();
+    if (idx < 0) return;
     if (MessageBoxW(g_main.hWnd, L"确定要删除选中的收藏吗？", L"确认", MB_YESNO | MB_ICONQUESTION) != IDYES) {
         return;
     }
     FavoriteDelete(idx);
     SaveFavorites();
+    /* 删除后选中同位置（或最后一项） */
+    if (g_favCount > 0) {
+        LvSetSelected(idx < g_favCount ? idx : g_favCount - 1);
+    }
 }
+
+static void OnMoveUp(void)
+{
+    int idx = LvGetSelected();
+    if (idx <= 0) return;
+    FavoriteSwap(idx, idx - 1);
+    LvSetSelected(idx - 1);
+    SaveFavorites();
+}
+
+static void OnMoveDown(void)
+{
+    int idx = LvGetSelected();
+    if (idx < 0 || idx >= g_favCount - 1) return;
+    FavoriteSwap(idx, idx + 1);
+    LvSetSelected(idx + 1);
+    SaveFavorites();
+}
+
+/* 初始化 ListView：添加两列并设置扩展样式。 */
+static void InitListView(HWND hList, int totalWidth)
+{
+    ListView_SetExtendedListViewStyle(hList,
+        LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+
+    int colName = totalWidth * 30 / 100;   /* 名称列 30% */
+    int colUrl  = totalWidth - colName;    /* URL 列其余 */
+
+    LVCOLUMNW col = { 0 };
+    col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+
+    col.iSubItem = 0;
+    col.cx       = colName;
+    col.pszText  = L"名称";
+    ListView_InsertColumn(hList, 0, &col);
+
+    col.iSubItem = 1;
+    col.cx       = colUrl;
+    col.pszText  = L"播放地址";
+    ListView_InsertColumn(hList, 1, &col);
+}
+
+/* 工具栏高度常量：按钮垂直居中于 44px 区域，下方 1px 分隔线 */
+#define TOOLBAR_H   44
+#define TOOLBAR_SEP 1   /* 分隔线高度 */
+#define LIST_TOP    (TOOLBAR_H + TOOLBAR_SEP + 6)
 
 static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
@@ -724,28 +832,45 @@ static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
         g_main.hWnd = hWnd;
         GetConfigPath(g_main.configPath, MAX_PATH);
 
+        /* 按钮垂直居中于工具栏区域 */
+        int btnH = 28;
+        int btnY = (TOOLBAR_H - btnH) / 2;
+
+        int x = 12;
         CreateWindowW(L"BUTTON", L"添加",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            10, 10, 60, 25, hWnd, (HMENU)ID_BTN_ADD, g_hInst, NULL);
-
+            x, btnY, 64, btnH, hWnd, (HMENU)ID_BTN_ADD, g_hInst, NULL);
+        x += 72;
         CreateWindowW(L"BUTTON", L"删除",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            80, 10, 60, 25, hWnd, (HMENU)ID_BTN_DEL, g_hInst, NULL);
-
+            x, btnY, 64, btnH, hWnd, (HMENU)ID_BTN_DEL, g_hInst, NULL);
+        x += 72;
         CreateWindowW(L"BUTTON", L"播放",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            150, 10, 60, 25, hWnd, (HMENU)ID_BTN_PLAY, g_hInst, NULL);
+            x, btnY, 64, btnH, hWnd, (HMENU)ID_BTN_PLAY, g_hInst, NULL);
+        x += 80;   /* 播放后留稍大间距，视觉分组 */
+        CreateWindowW(L"BUTTON", L"↑",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            x, btnY, 38, btnH, hWnd, (HMENU)ID_BTN_UP, g_hInst, NULL);
+        x += 46;
+        CreateWindowW(L"BUTTON", L"↓",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            x, btnY, 38, btnH, hWnd, (HMENU)ID_BTN_DOWN, g_hInst, NULL);
 
-        g_main.hList = CreateWindowW(L"LISTBOX", NULL,
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_STANDARD,
-            10, 45, 440, 300, hWnd, (HMENU)ID_LISTBOX, g_hInst, NULL);
+        /* ListView：紧贴分隔线下方，四边留 8px 边距 */
+        g_main.hList = CreateWindowExW(0, WC_LISTVIEWW, NULL,
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL |
+            LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+            8, LIST_TOP, 644, 340, hWnd, (HMENU)ID_LISTVIEW, g_hInst, NULL);
 
+        /* 设置现代字体 */
         HWND hChild = GetWindow(hWnd, GW_CHILD);
         while (hChild) {
-            SetDefaultFont(hChild);
+            SetModernFont(hChild);
             hChild = GetWindow(hChild, GW_HWNDNEXT);
         }
 
+        InitListView(g_main.hList, 644);
         LoadFavorites();
         break;
     }
@@ -754,9 +879,54 @@ static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
         int w = LOWORD(lParam);
         int h = HIWORD(lParam);
         if (g_main.hList) {
-            MoveWindow(g_main.hList, 10, 45, w - 20, h - 55, TRUE);
+            int lw = w - 16;
+            int lh = h - LIST_TOP - 8;
+            if (lw < 0) lw = 0;
+            if (lh < 0) lh = 0;
+            MoveWindow(g_main.hList, 8, LIST_TOP, lw, lh, TRUE);
+            /* 调整列宽：名称 30%，URL 其余 */
+            int inner = lw - GetSystemMetrics(SM_CXVSCROLL) - 2;
+            if (inner > 0) {
+                int colName = inner * 30 / 100;
+                ListView_SetColumnWidth(g_main.hList, 0, colName);
+                ListView_SetColumnWidth(g_main.hList, 1, inner - colName);
+            }
         }
+        /* 重绘工具栏区域（分隔线） */
+        RECT rcBar = { 0, 0, LOWORD(lParam), TOOLBAR_H + TOOLBAR_SEP };
+        InvalidateRect(hWnd, &rcBar, FALSE);
         break;
+    }
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+
+        RECT rcClient;
+        GetClientRect(hWnd, &rcClient);
+
+        /* 工具栏背景：使用系统按钮面色（与 Visual Styles 一致） */
+        RECT rcBar = { 0, 0, rcClient.right, TOOLBAR_H };
+        HBRUSH hbrBar = GetSysColorBrush(COLOR_BTNFACE);
+        FillRect(hdc, &rcBar, hbrBar);
+
+        /* 分隔线：单像素，颜色取系统 3D 阴影色 */
+        RECT rcSep = { 0, TOOLBAR_H, rcClient.right, TOOLBAR_H + TOOLBAR_SEP };
+        HBRUSH hbrSep = GetSysColorBrush(COLOR_BTNSHADOW);
+        FillRect(hdc, &rcSep, hbrSep);
+
+        EndPaint(hWnd, &ps);
+        break;
+    }
+    case WM_ERASEBKGND:
+    {
+        /* 用 COLOR_WINDOW 填充 ListView 下方区域，避免闪烁 */
+        HDC hdc = (HDC)wParam;
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+        RECT rcBelow = { 0, TOOLBAR_H + TOOLBAR_SEP, rc.right, rc.bottom };
+        FillRect(hdc, &rcBelow, GetSysColorBrush(COLOR_WINDOW));
+        return 1;
     }
     case WM_COMMAND:
     {
@@ -767,13 +937,26 @@ static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
             OnDelFavorite();
         } else if (id == ID_BTN_PLAY) {
             PlaySelected();
-        } else if (id == ID_LISTBOX && HIWORD(wParam) == LBN_DBLCLK) {
+        } else if (id == ID_BTN_UP) {
+            OnMoveUp();
+        } else if (id == ID_BTN_DOWN) {
+            OnMoveDown();
+        }
+        break;
+    }
+    case WM_NOTIFY:
+    {
+        NMHDR *nmhdr = (NMHDR *)lParam;
+        if (nmhdr->idFrom == ID_LISTVIEW && nmhdr->code == NM_DBLCLK) {
             PlaySelected();
         }
         break;
     }
     case WM_DESTROY:
         FavoriteClear();
+        free(g_favorites);
+        g_favorites = NULL;
+        if (g_hFont) { DeleteObject(g_hFont); g_hFont = NULL; }
         PlaybackWindowCloseAll();
         PostQuitMessage(0);
         break;
@@ -797,9 +980,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
 
     EnsureDefaultMpvConfig();
 
-    INITCOMMONCONTROLSEX iccex = { sizeof(iccex), ICC_STANDARD_CLASSES };
+    /* 现代字体（在创建任何窗口之前初始化） */
+    CreateModernFont();
+
+    INITCOMMONCONTROLSEX iccex = { sizeof(iccex), ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&iccex);
 
+    /* 主窗口：背景设为 NULL，由 WM_ERASEBKGND / WM_PAINT 自行绘制，
+       避免工具栏区域与列表区域颜色不一致的闪烁。 */
     WNDCLASSEXW wcexMain = { 0 };
     wcexMain.cbSize = sizeof(wcexMain);
     wcexMain.style = CS_HREDRAW | CS_VREDRAW;
@@ -807,7 +995,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     wcexMain.hInstance = hInstance;
     wcexMain.hIcon = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
     wcexMain.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
-    wcexMain.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wcexMain.hbrBackground = NULL;   /* 自绘背景 */
     wcexMain.lpszClassName = L"LivePlayerMainClass";
     wcexMain.hIconSm = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
 
@@ -823,7 +1011,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     wcexVideo.hInstance = hInstance;
     wcexVideo.hIcon = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
     wcexVideo.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
-    wcexVideo.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wcexVideo.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     wcexVideo.lpszClassName = L"LivePlayerVideoClass";
     wcexVideo.hIconSm = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
 
@@ -833,8 +1021,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     }
 
     HWND hWnd = CreateWindowW(L"LivePlayerMainClass", L"LivePlayer",
-        WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME,
-        CW_USEDEFAULT, 0, 480, 400,
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, 0, 680, 480,
         NULL, NULL, hInstance, NULL);
 
     if (!hWnd) {

@@ -29,7 +29,7 @@ _deps/
 *.ilk
 *.idb
 *.res
-*.manifest
+# *.manifest 不忽略：src/app.manifest 是源文件需要追踪
 
 # Logs
 *.log
