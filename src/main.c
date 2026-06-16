@@ -96,6 +96,14 @@ static void TrimWhitespace(wchar_t *str)
     }
 }
 
+static void TrimLineEnding(wchar_t *str)
+{
+    size_t len = wcslen(str);
+    while (len > 0 && (str[len - 1] == L'\n' || str[len - 1] == L'\r')) {
+        str[--len] = L'\0';
+    }
+}
+
 static void GetConfigPath(wchar_t *out, size_t size)
 {
     wchar_t path[MAX_PATH];
@@ -126,6 +134,209 @@ static void GetExeDirectory(wchar_t *out, size_t size)
     if (slash) slash[1] = L'\0';
     wcsncpy(out, path, size - 1);
     out[size - 1] = L'\0';
+}
+
+/* ── Cookie 合并 ─────────────────────────────────────────── */
+
+typedef struct {
+    wchar_t *line;    /* 原始行内容（不含换行） */
+    wchar_t *domain;  /* 第 0 字段，用于去重键 */
+    wchar_t *path;    /* 第 2 字段，用于去重键 */
+    wchar_t *name;    /* 第 5 字段，用于去重键 */
+} CookieEntry;
+
+static BOOL CookieEnsureCapacity(CookieEntry **entries, size_t *count, size_t *capacity)
+{
+    if (*count < *capacity) return TRUE;
+    size_t newCap = *capacity ? *capacity * 2 : 16;
+    CookieEntry *p = (CookieEntry *)realloc(*entries, newCap * sizeof(CookieEntry));
+    if (!p) return FALSE;
+    *entries = p;
+    *capacity = newCap;
+    return TRUE;
+}
+
+/* 读取 Netscape cookie 文件，按 (domain, path, name) 去重。
+   后读取到的重复键会覆盖先读取到的键。注释行与格式错误的行保留原样。 */
+static void ReadCookieFile(const wchar_t *path, CookieEntry **entries, size_t *count, size_t *capacity)
+{
+    FILE *fp = _wfopen(path, L"r, ccs=UTF-8");
+    if (!fp) return;
+
+    wchar_t buf[4096];
+    while (fgetws(buf, 4096, fp)) {
+        TrimLineEnding(buf);
+        if (buf[0] == L'\0') continue;
+
+        wchar_t *lineCopy = _wcsdup(buf);
+        if (!lineCopy) continue;
+
+        /* 注释行直接保留 */
+        if (buf[0] == L'#') {
+            if (!CookieEnsureCapacity(entries, count, capacity)) { free(lineCopy); continue; }
+            size_t idx = *count;
+            (*entries)[idx].line = lineCopy;
+            (*entries)[idx].domain = NULL;
+            (*entries)[idx].path = NULL;
+            (*entries)[idx].name = NULL;
+            (*count)++;
+            continue;
+        }
+
+        /* 解析制表符分隔字段：domain flag path secure expires name value */
+        wchar_t parseBuf[4096];
+        wcsncpy(parseBuf, buf, 4095);
+        parseBuf[4095] = L'\0';
+
+        wchar_t *fields[7] = { 0 };
+        int nFields = 0;
+        wchar_t *saveptr = NULL;
+        wchar_t *token = wcstok(parseBuf, L"\t", &saveptr);
+        while (token && nFields < 7) {
+            fields[nFields++] = token;
+            token = wcstok(NULL, L"\t", &saveptr);
+        }
+
+        /* 字段不足时保留原行但不去重 */
+        if (nFields < 7) {
+            if (!CookieEnsureCapacity(entries, count, capacity)) { free(lineCopy); continue; }
+            size_t idx = *count;
+            (*entries)[idx].line = lineCopy;
+            (*entries)[idx].domain = NULL;
+            (*entries)[idx].path = NULL;
+            (*entries)[idx].name = NULL;
+            (*count)++;
+            continue;
+        }
+
+        /* 查找是否已存在相同 (domain, path, name) */
+        int existing = -1;
+        for (size_t i = 0; i < *count; i++) {
+            CookieEntry *e = &(*entries)[i];
+            if (e->domain && e->path && e->name &&
+                wcscmp(e->domain, fields[0]) == 0 &&
+                wcscmp(e->path, fields[2]) == 0 &&
+                wcscmp(e->name, fields[5]) == 0) {
+                existing = (int)i;
+                break;
+            }
+        }
+
+        if (existing >= 0) {
+            free((*entries)[existing].line);
+            (*entries)[existing].line = lineCopy;
+        } else {
+            if (!CookieEnsureCapacity(entries, count, capacity)) { free(lineCopy); continue; }
+            size_t idx = *count;
+            (*entries)[idx].line = lineCopy;
+            (*entries)[idx].domain = _wcsdup(fields[0]);
+            (*entries)[idx].path = _wcsdup(fields[2]);
+            (*entries)[idx].name = _wcsdup(fields[5]);
+            (*count)++;
+        }
+    }
+    fclose(fp);
+}
+
+/* 启动时先把已有的 cookies_aio.txt 作为基础，再合并所有 *_cookies.txt。
+   后读取到的重复 (domain, path, name) 覆盖先读取到的。合并完成后删除源文件。 */
+static void MergeCookieFiles(void)
+{
+    wchar_t exeDir[MAX_PATH];
+    GetExeDirectory(exeDir, MAX_PATH);
+    if (exeDir[0] == L'\0') return;
+
+    wchar_t destPath[MAX_PATH];
+    if (_snwprintf(destPath, MAX_PATH, L"%scookies_aio.txt", exeDir) < 0) return;
+
+    CookieEntry *entries = NULL;
+    size_t count = 0, capacity = 0;
+
+    /* 1. 先读取已有的 cookies_aio.txt 作为基础 */
+    ReadCookieFile(destPath, &entries, &count, &capacity);
+
+    /* 2. 收集 *_cookies.txt 源文件路径 */
+    wchar_t **srcPaths = NULL;
+    size_t srcCount = 0, srcCapacity = 0;
+
+    wchar_t pattern[MAX_PATH];
+    if (_snwprintf(pattern, MAX_PATH, L"%s*_cookies.txt", exeDir) >= 0) {
+        WIN32_FIND_DATAW findData;
+        HANDLE hFind = FindFirstFileW(pattern, &findData);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+
+                wchar_t srcPath[MAX_PATH];
+                if (_snwprintf(srcPath, MAX_PATH, L"%s%s", exeDir, findData.cFileName) < 0) continue;
+                if (_wcsicmp(srcPath, destPath) == 0) continue;
+
+                if (srcCount == srcCapacity) {
+                    size_t newCap = srcCapacity ? srcCapacity * 2 : 4;
+                    wchar_t **p = (wchar_t **)realloc(srcPaths, newCap * sizeof(wchar_t *));
+                    if (!p) continue;
+                    srcPaths = p;
+                    srcCapacity = newCap;
+                }
+                wchar_t *dup = _wcsdup(srcPath);
+                if (dup) srcPaths[srcCount++] = dup;
+            } while (FindNextFileW(hFind, &findData));
+            FindClose(hFind);
+        }
+    }
+
+    if (srcCount == 0) {
+        /* 没有新文件需要合并，保留现有 cookies_aio.txt 不动 */
+        for (size_t i = 0; i < count; i++) {
+            free(entries[i].line);
+            free(entries[i].domain);
+            free(entries[i].path);
+            free(entries[i].name);
+        }
+        free(entries);
+        free(srcPaths);
+        return;
+    }
+
+    /* 3. 按任意顺序读取源文件（后读取的重复键覆盖前者） */
+    for (size_t i = 0; i < srcCount; i++) {
+        ReadCookieFile(srcPaths[i], &entries, &count, &capacity);
+    }
+
+    /* 4. 写回 cookies_aio.txt */
+    FILE *dest = _wfopen(destPath, L"w, ccs=UTF-8");
+    if (!dest) {
+        for (size_t i = 0; i < srcCount; i++) free(srcPaths[i]);
+        free(srcPaths);
+        for (size_t i = 0; i < count; i++) {
+            free(entries[i].line);
+            free(entries[i].domain);
+            free(entries[i].path);
+            free(entries[i].name);
+        }
+        free(entries);
+        return;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        fwprintf(dest, L"%s\n", entries[i].line);
+    }
+    fclose(dest);
+
+    /* 5. 写入成功后才删除源文件 */
+    for (size_t i = 0; i < srcCount; i++) {
+        DeleteFileW(srcPaths[i]);
+        free(srcPaths[i]);
+    }
+    free(srcPaths);
+
+    for (size_t i = 0; i < count; i++) {
+        free(entries[i].line);
+        free(entries[i].domain);
+        free(entries[i].path);
+        free(entries[i].name);
+    }
+    free(entries);
 }
 
 static void EnsureDefaultMpvConfig(void)
@@ -528,6 +739,23 @@ static BOOL InitPlaybackMpv(PlaybackContext *ctx, HWND hVideo, const wchar_t *ur
         if (ytdlPath) {
             g_mpv.set_option_string(ctx->mpv, "ytdl-path", ytdlPath);
             free(ytdlPath);
+        }
+    }
+
+    /* 如果启动时合并生成了 cookies_aio.txt，则传给 mpv 用于 yt-dlp。 */
+    if (exeDir[0] != L'\0') {
+        wchar_t cookiePath[MAX_PATH];
+        if (_snwprintf(cookiePath, MAX_PATH, L"%scookies_aio.txt", exeDir) >= 0) {
+            DWORD attr = GetFileAttributesW(cookiePath);
+            if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                char *cookieDir = WideToUtf8(exeDir);
+                if (cookieDir) {
+                    char optVal[MAX_PATH * 4];
+                    snprintf(optVal, sizeof(optVal), "cookies=%scookies_aio.txt", cookieDir);
+                    g_mpv.set_option_string(ctx->mpv, "ytdl-raw-options", optVal);
+                    free(cookieDir);
+                }
+            }
         }
     }
 
@@ -979,6 +1207,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     }
 
     EnsureDefaultMpvConfig();
+    MergeCookieFiles();
 
     /* 现代字体（在创建任何窗口之前初始化） */
     CreateModernFont();
