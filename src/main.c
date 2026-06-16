@@ -303,8 +303,8 @@ static void MergeCookieFiles(void)
         ReadCookieFile(srcPaths[i], &entries, &count, &capacity);
     }
 
-    /* 4. 写回 cookies_aio.txt */
-    FILE *dest = _wfopen(destPath, L"w, ccs=UTF-8");
+    /* 4. 写回 cookies_aio.txt（yt-dlp 只接受无 BOM 的 UTF-8/ASCII） */
+    FILE *dest = _wfopen(destPath, L"wb");
     if (!dest) {
         for (size_t i = 0; i < srcCount; i++) free(srcPaths[i]);
         free(srcPaths);
@@ -319,7 +319,11 @@ static void MergeCookieFiles(void)
     }
 
     for (size_t i = 0; i < count; i++) {
-        fwprintf(dest, L"%s\n", entries[i].line);
+        char *utf8 = WideToUtf8(entries[i].line);
+        if (!utf8) continue;
+        fwrite(utf8, 1, strlen(utf8), dest);
+        fputc('\n', dest);
+        free(utf8);
     }
     fclose(dest);
 
