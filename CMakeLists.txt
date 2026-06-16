@@ -34,9 +34,11 @@ add_executable(${PROJECT_NAME} WIN32 ${SOURCES})
 
 # 禁用链接器自动生成 manifest：我们已在 resource.rc 中通过 RT_MANIFEST 嵌入了自定义 manifest
 if(MSVC)
-    set_target_properties(${PROJECT_NAME} PROPERTIES
-        LINK_FLAGS "/MANIFEST:NO"
-    )
+    target_link_options(${PROJECT_NAME} PRIVATE "/MANIFEST:NO")
+    # 强制 MSVC 以 UTF-8 解析源文件，避免无 BOM 时中文字符串编译乱码
+    target_compile_options(${PROJECT_NAME} PRIVATE /utf-8)
+else()
+    target_link_options(${PROJECT_NAME} PRIVATE "-municode")
 endif()
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
