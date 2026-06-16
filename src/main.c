@@ -42,6 +42,7 @@ typedef struct {
     WINDOWPLACEMENT savedPlacement;
     char errLog[8192];
     size_t errLogLen;
+    BOOL handlingEvents;
 } PlaybackContext;
 
 typedef struct {
@@ -637,11 +638,18 @@ static void SetPlaybackFullscreen(PlaybackContext *ctx, BOOL fullscreen)
 static void OnMpvEvent(PlaybackContext *ctx)
 {
     if (!ctx || !ctx->mpv) return;
+    /* MessageBox 等模态对话框会运行内部消息循环，可能再次触发 WM_MPV_EVENT。
+       若嵌套处理导致窗口被销毁（如 idle=no 时播放错误同时收到 SHUTDOWN），
+       外层循环会在对话框返回后继续访问已释放的 ctx。使用标志防止重入。 */
+    if (ctx->handlingEvents) return;
+    ctx->handlingEvents = TRUE;
+
     while (1) {
         mpv_event *e = g_mpv.wait_event(ctx->mpv, 0);
         if (e->event_id == MPV_EVENT_NONE) break;
 
         if (e->event_id == MPV_EVENT_SHUTDOWN) {
+            ctx->handlingEvents = FALSE;
             DestroyWindow(ctx->hWnd);
             return;
         }
@@ -697,6 +705,7 @@ static void OnMpvEvent(PlaybackContext *ctx)
             }
         }
     }
+    ctx->handlingEvents = FALSE;
 }
 
 static void MpvWakeupCb(void *d)
