@@ -4,6 +4,9 @@
 /* 嵌入应用程序清单（启用 ComCtl32 v6 Visual Styles + Per-Monitor DPI v2） */
 1 RT_MANIFEST "app.manifest"
 
+/* 应用程序图标 */
+IDI_APP_ICON ICON "liveplayer.ico"
+
 IDD_DIALOG_ADD DIALOGEX 0, 0, 420, 120
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "添加收藏"

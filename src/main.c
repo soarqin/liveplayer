@@ -72,6 +72,11 @@ static struct {
 static HINSTANCE g_hInst = NULL;
 static HwndList g_playbackWindows = { 0 };
 
+static HICON AppIconLoad(void)
+{
+    return LoadIconW(g_hInst, MAKEINTRESOURCEW(IDI_APP_ICON));
+}
+
 static char *WideToUtf8(const wchar_t *wstr)
 {
     if (!wstr) return NULL;
@@ -961,6 +966,11 @@ static INT_PTR CALLBACK AddFavoriteDlgProc(HWND hDlg, UINT message, WPARAM wPara
         data = (AddDlgData *)lParam;
         SetDlgItemTextW(hDlg, IDC_EDIT_NAME, L"");
         SetDlgItemTextW(hDlg, IDC_EDIT_URL, L"");
+        {
+            HICON hIcon = AppIconLoad();
+            SendMessageW(hDlg, WM_SETICON, ICON_BIG, (LPARAM)hIcon);
+            SendMessageW(hDlg, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
+        }
         return (INT_PTR)TRUE;
     case WM_COMMAND:
         if (LOWORD(wParam) == IDOK) {
@@ -1235,11 +1245,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     wcexMain.style = CS_HREDRAW | CS_VREDRAW;
     wcexMain.lpfnWndProc = MainWndProc;
     wcexMain.hInstance = hInstance;
-    wcexMain.hIcon = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
+    wcexMain.hIcon = AppIconLoad();
     wcexMain.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
     wcexMain.hbrBackground = NULL;   /* 自绘背景 */
     wcexMain.lpszClassName = L"LivePlayerMainClass";
-    wcexMain.hIconSm = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
+    wcexMain.hIconSm = AppIconLoad();
 
     if (!RegisterClassExW(&wcexMain)) {
         MessageBoxW(NULL, L"注册主窗口类失败。", L"错误", MB_OK | MB_ICONERROR);
@@ -1251,11 +1261,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     wcexVideo.style = CS_HREDRAW | CS_VREDRAW;
     wcexVideo.lpfnWndProc = PlaybackWndProc;
     wcexVideo.hInstance = hInstance;
-    wcexVideo.hIcon = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
+    wcexVideo.hIcon = AppIconLoad();
     wcexVideo.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
     wcexVideo.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     wcexVideo.lpszClassName = L"LivePlayerVideoClass";
-    wcexVideo.hIconSm = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
+    wcexVideo.hIconSm = AppIconLoad();
 
     if (!RegisterClassExW(&wcexVideo)) {
         MessageBoxW(NULL, L"注册播放窗口类失败。", L"错误", MB_OK | MB_ICONERROR);
