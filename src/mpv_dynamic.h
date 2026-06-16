@@ -1,4 +1,4 @@
-﻿#ifndef MPV_DYNAMIC_H
+#ifndef MPV_DYNAMIC_H
 #define MPV_DYNAMIC_H
 
 #include <windows.h>

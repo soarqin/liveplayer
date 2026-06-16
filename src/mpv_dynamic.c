@@ -1,4 +1,4 @@
-﻿#include "mpv_dynamic.h"
+#include "mpv_dynamic.h"
 
 #include <stdio.h>
 
