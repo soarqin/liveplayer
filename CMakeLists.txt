@@ -50,6 +50,8 @@ if(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE /utf-8)
 else()
     target_link_options(${PROJECT_NAME} PRIVATE "-municode")
+    # 强制 GNU/LLVM windres 以 UTF-8 解析资源文件，避免中文对话框乱码
+    set(CMAKE_RC_FLAGS "${CMAKE_RC_FLAGS} --codepage=65001")
 endif()
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
